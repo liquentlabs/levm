@@ -1,0 +1,256 @@
+# Testing & Benchmarking Levm
+
+This guide covers how to run Levm's tests and benchmarks, how to replay real Ethereum mainnet
+blocks (including EIP-7702 transactions) through the parallel scheduler, and the environment
+variables that tune execution.
+
+## Cargo features
+
+| Feature | Pulls in | Used by |
+| --- | --- | --- |
+| `test-utils` | mock accounts, `InMemoryDB`, execute/compare helpers, the mainnet fixture schema (`serde`, `serde_json`, `revm-primitives/serde`, `metrics-util`) | integration tests and benchmarks |
+| `tools` | `test-utils` **+** a blocking HTTP client (`ureq`) | `fetch_block`, `fetch_continuous`, and `replay_mainnet` |
+
+`tools` is kept separate from `test-utils` so the test/bench path never compiles the HTTP client,
+and a normal library build (e.g. when Levm is a dependency) pulls in neither.
+
+## Running the tests
+
+```bash
+cargo test --features test-utils
+```
+
+This builds and runs:
+
+| Target | What it covers |
+| --- | --- |
+| lib unit tests | core data-structure and scheduler invariants |
+| `tests/erc20.rs` | ERC-20 transfer workloads |
+| `tests/native_transfers.rs` | raw value-transfer workloads (independent / chained / hybrid) |
+| `tests/uniswap.rs` | Uniswap swap workloads |
+| `tests/eip-7702.rs` | synthetic EIP-7702 scenarios: delegate / re-delegate / reset / multi-authority; storage preservation when an already-delegated EOA with storage is re-delegated (the block-22546209 bug); and interaction with `CREATE`/`CREATE2` and `SELFDESTRUCT` |
+| `tests/delegated_safety.rs` | opt-in delegated CREATE/CREATE2 and reserve-balance policy matrix; ordinary CREATE/CREATE2 compatibility, ample/exact/insufficient reserve boundaries, first-debit balance protection, authorization-refund preservation, rollback, SELFDESTRUCT, and a coordinated stale speculative read that must be invalidated and re-executed before matching sequential execution |
+| `tests/mainnet.rs` | replays real mainnet blocks from fixtures (skips if none present) |
+
+Compatibility integration tests compare **Levm parallel execution against a sequential revm
+reference** and assert both per-transaction results and final bundle state. The levm-specific
+delegated-safety tests use explicit expected outcomes; their combined policy matrix also compares
+parallel execution against Levm's forced-sequential path.
+
+The shared revm-compatibility helpers explicitly use `DelegatedSafetyConfig::disabled()`: mainnet
+replay and upstream EIP-7702 regression tests therefore remain pure levm-vs-revm equivalence
+checks even if the policy defaults change. Policy-enabled behavior is tested separately in
+`tests/delegated_safety.rs`. Real-mainnet replay is strict: a sequential reference error, Levm
+execution error, or skipped transaction fails immediately because every transaction included in a
+canonical mainnet block is consensus-valid.
+
+Plain `cargo test` runs the core library unit tests without optional features; the integration
+targets are skipped by their `required-features` declarations. Integration suites and all
+benchmarks require `--features test-utils`.
+
+## Environment-variable knobs
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `LEVM_MIN_PARALLEL_TXS` | `64` | Blocks with fewer transactions fall back to sequential. Set to `0` to force the parallel path even for tiny blocks (needed when replaying small real blocks). |
+| `LEVM_FALLBACK_SEQUENTIAL` | `false` | Force sequential execution for every block. |
+| `LEVM_CONCURRENT_LEVEL` | logical CPUs reported by `available_parallelism` (or `8` if unavailable) | Number of speculative execution workers. |
+| `LEVM_MAINNET_BLOCKS` | `test_data/mainnet_blocks` | Directory the mainnet replay test reads single-block fixtures from. |
+| `LEVM_MAINNET_BLOCK` | unset | If set, replay only this fixture number. |
+| `LEVM_CONTINUOUS_BLOCKS` | `test_data/con_eth_blocks` | Directory the `continuous` bench reads merged "big block" fixtures from. |
+| `LEVM_CONTINUOUS_RANGE` | unset | If set, replay only this merged-block directory name. |
+| `LEVM_PRINT_METRICS` | unset | Print captured Levm metrics from replay helpers. |
+
+Benchmark-only tuning (read by `benches/gigagas.rs`): `NUM_EOA` (default `100000`), `HOT_RATIO`
+(`0.0`), `DB_LATENCY_US` (`0`), `DEPENDENCY_RATIO` (`0.1`),
+`DEPENDENCY_DISTANCE` (`8`), `FILTER` (substring filter for which sub-benchmarks to run).
+
+These execution knobs are represented by `LevmConfig` together with
+`DelegatedSafetyConfig`. `Scheduler::new(...)` calls `LevmConfig::from_env()` as a convenience;
+production integrations can use `Scheduler::new_with_runtime_config(...)` and
+`Scheduler::execute()` to avoid process-global environment reads and make the block execution
+policy explicit.
+
+## Replaying real mainnet blocks
+
+Levm can replay real mainnet blocks and check that parallel execution matches sequential revm on
+the exact same inputs. The block's *execution environment* is downloaded over JSON-RPC and stored
+as a self-contained fixture. Once downloaded, replaying that fixture needs no node or archive
+database.
+
+### 1. Fetch a block
+
+Fetching a historical block requires an endpoint that serves historical state (typically an
+archive-capable endpoint) and enables the `debug` namespace. The fetcher uses
+`debug_traceBlockByNumber` with the `prestateTracer`. Find blocks containing EIP-7702 (type-4)
+transactions via <https://etherscan.io/txnauthlist>.
+
+```bash
+cargo run --bin fetch_block --features tools -- <block> <rpc_url> [spec] [out_dir]
+```
+
+- `block`   — decimal (`25323281`) or hex (`0x1826711`).
+- `rpc_url` — HTTP JSON-RPC endpoint.
+- `spec`    — optional hardfork override (e.g. `Prague`); inferred from the block timestamp otherwise.
+- `out_dir` — optional output root (default `test_data/mainnet_blocks`).
+
+This writes `test_data/mainnet_blocks/<block>/{block,txs,pre_state}.json`.
+
+### 2. Run the replay
+
+```bash
+# Replay every single-block fixture under test_data/mainnet_blocks/
+LEVM_MIN_PARALLEL_TXS=0 cargo test --features test-utils --test mainnet replay_mainnet_blocks
+
+# Replay every hardfork-boundary fixture under test_data/spec_coverage/
+LEVM_MIN_PARALLEL_TXS=0 LEVM_MAINNET_BLOCKS=test_data/spec_coverage \
+  cargo test --features test-utils --test mainnet replay_mainnet_blocks
+
+# Replay just one block
+LEVM_MIN_PARALLEL_TXS=0 LEVM_MAINNET_BLOCK=25323281 \
+  cargo test --features test-utils --test mainnet replay_mainnet_blocks
+```
+
+`LEVM_MIN_PARALLEL_TXS=0` forces the parallel path even though real blocks are frequently smaller
+than 64 transactions. Without `LEVM_MAINNET_BLOCK` the test loads every fixture under
+`LEVM_MAINNET_BLOCKS` and asserts parallel == sequential for each.
+
+### 3. Pipelined discover-and-replay (`replay_mainnet`)
+
+To validate many real blocks without committing fixtures, the `replay_mainnet` binary discovers
+blocks over RPC and replays each in-process, prefetching the next block while replaying the current
+one (a background thread fetches block N+1 while the main thread replays block N):
+
+```bash
+cargo run --bin replay_mainnet --features tools -- <rpc_url> [filter] [start_block] [count] [out_dir]
+```
+
+Blocks are scanned **upward** toward the chain head.
+
+- `filter`      — which blocks to replay:
+  - `all` (default): every non-empty block;
+  - `eip-7702`: blocks with a type-4 transaction;
+  - `delegated-safety`: candidate blocks where an EIP-7702 delegated state context creates a
+    contract or moves balance through CALL/SELFDESTRUCT. This uses the built-in `callTracer` plus
+    batched historical `eth_getCode` calls, so it works with providers that reject custom
+    JavaScript tracers.
+- `start_block` — where to start scanning. Default: the mainnet EIP-7702 activation block
+  (`22431084`, Pectra, 2025-05-07).
+- `count`       — how many matching blocks to replay. Default: **all** of them up to the chain head.
+- `out_dir`     — optional. If given, each replayed block's fixture is written to
+  `<out_dir>/<number>/`. Omitted ⇒ fetched in memory only, **nothing is written to disk** (so the
+  "all" mode doesn't fill the disk with millions of fixtures).
+
+```bash
+# Replay every EIP-7702 block since activation (large job — dominated by one
+# debug_traceBlockByNumber per block; interrupt any time), in memory only:
+cargo run --bin replay_mainnet --features tools -- <rpc_url> eip-7702
+
+# Find and replay the first delegated CREATE/CREATE2/balance-movement candidate:
+cargo run --bin replay_mainnet --features tools -- \
+  <rpc_url> delegated-safety 22431084 1
+
+# Replay 20 (any) blocks from a height AND persist them under test_data/mainnet_blocks/:
+cargo run --bin replay_mainnet --features tools -- <rpc_url> all 25323281 20 test_data/mainnet_blocks
+```
+
+Each block is validated as it arrives, and its **execution-only** times (the inputs are already in
+memory, so neither figure includes RPC/file I/O) are printed per block and accumulated into a final
+aggregate parallel-vs-sequential speedup. On the **first** invalid replay input, sequential/Levm
+execution error, skipped transaction, or result divergence, it prints the offending block and
+exits non-zero. Without `out_dir` nothing is written to disk — use `fetch_block` or pass `out_dir`
+to persist a fixture.
+
+> Note: with an in-memory fixture the database has ~zero read latency, so the measured speedup is
+> compute-bound and understates the win on a real node, where parallel execution also hides storage
+> I/O latency.
+
+### Oracle & scope
+
+The replay oracle is **parallel == sequential on identical inputs**. It is intentionally *not*
+mainnet-state-root faithful:
+
+- Block-level system calls (EIP-4788/2935/7002/7251) and withdrawals are not applied (they are not
+  part of the transaction list).
+- Blob gas price is pinned to the protocol minimum (this revm build models blob fees up to Prague
+  only), so type-3 transactions are never spuriously rejected.
+
+Two inputs that `prestateTracer` does **not** report are captured separately so transactions that
+depend on them still replay faithfully:
+
+- the last 256 block hashes (for the `BLOCKHASH` opcode), and
+- the code of EIP-7702 delegation targets (the contract executed when a delegated account is called;
+  collected from each type-4 tx's `authorization_list` and from existing `0xef0100` designators).
+
+Both executors see exactly the same environment, so the comparison stays valid regardless.
+
+## Merged "big block" benchmark
+
+To stress single-block parallelism beyond what one real block provides, `fetch_continuous` merges a
+range of consecutive blocks into one oversized block: all transactions are concatenated, their
+prestate read sets merged, a single (lowest-basefee) block environment is chosen, and any
+transaction that cannot execute under that merged environment is filtered out.
+
+```bash
+# Merge `count` consecutive blocks starting at `start` into test_data/con_eth_blocks/<start>_<end>/
+cargo run --bin fetch_continuous --features tools -- <start> <count> <rpc_url> [out_dir]
+
+# Benchmark Levm parallel vs revm sequential over the merged block(s)
+cargo bench --features test-utils --bench continuous
+
+# Replay them as a correctness test (all ranges, or one via LEVM_CONTINUOUS_RANGE)
+LEVM_MIN_PARALLEL_TXS=0 cargo test --features test-utils --test mainnet replay_continuous_blocks
+LEVM_MIN_PARALLEL_TXS=0 LEVM_CONTINUOUS_RANGE=25326115_25326124 \
+  cargo test --features test-utils --test mainnet replay_continuous_blocks
+```
+
+The `continuous` benchmark first verifies parallel == sequential on each big block, then times both.
+It skips cleanly when no fixtures are present. For a ~1-gigagas block, merge roughly 30+ blocks.
+
+## Benchmarks
+
+```bash
+# Synthetic workloads (ERC-20, Uniswap, raw transfers, hybrid)
+JEMALLOC_SYS_WITH_MALLOC_CONF="thp:always,metadata_thp:always" \
+NUM_EOA=<n> HOT_RATIO=<r> DB_LATENCY_US=<us> \
+cargo bench --features test-utils --bench gigagas
+
+# Real merged mainnet block(s) (see above)
+cargo bench --features test-utils --bench continuous
+```
+
+## `test_data/` layout & fetching the fixtures
+
+The fixtures live in a separate repository,
+[`levm-test-data`](https://github.com/liquentlabs/levm-test-data), wired in as a **git submodule** at
+`test_data/`. It is marked with `update = none` in `.gitmodules` so Cargo does not download the
+large test-only repository when Levm is used as a Git dependency. Levm developers and CI jobs
+that run the fixture-backed suites must opt in explicitly:
+
+```bash
+# Fresh clone:
+git clone <levm-url>
+cd levm
+
+# Fetch the fixtures at the commit pinned by Levm. This one-command override does not persist.
+git -c submodule.test_data.update=checkout \
+  submodule update --init test_data
+```
+
+When the submodule is not checked out, the mainnet replay test and the `continuous` benchmark skip
+gracefully.
+
+```
+test_data/
+├── mainnet_blocks/<block>/{block,txs,pre_state}.json        # single real blocks (fetch_block)
+├── spec_coverage/<block>/{block,txs,pre_state}.json         # hardfork-boundary regression set
+└── con_eth_blocks/<start>_<end>/{block,txs,pre_state}.json   # merged big blocks (fetch_continuous)
+```
+
+Each fixture is self-contained (account code is stored inline) and uses Levm's own stable JSON
+schema (see `src/test_utils/common/mainnet.rs`) rather than serializing revm's internal types, so it
+survives revm upgrades.
+
+> When you add new fixtures: commit & push them in the `levm-test-data` repo, then in this repo
+> `cd test_data && git checkout <new-commit>`, `git add test_data`, and commit the bumped submodule
+> pointer so CI / fresh checkouts pick up the new data.

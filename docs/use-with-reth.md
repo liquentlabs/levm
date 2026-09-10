@@ -1,0 +1,205 @@
+# Use Levm with reth
+
+## Add the dependency
+
+```toml
+[dependencies]
+levm = { git = "https://github.com/liquentlabs/levm.git", branch = "main" }
+```
+
+## Standalone usage
+
+Levm's public surface is small: build a `ParallelState` over any read-only database, hand it to a
+`Scheduler` together with the config/block environment and the transactions, then call
+`execute`. The database implements revm's read-only `DatabaseRef` trait and is `Send + Sync`; its
+error type is `Clone + Send + Sync + 'static`.
+
+```rust
+use std::sync::Arc;
+
+use levm::{LevmConfig, ParallelState, ParallelTakeBundle, Scheduler, TxExecutionOutcome};
+use revm::DatabaseRef;
+use revm_context::{BlockEnv, CfgEnv, TxEnv};
+use revm_database::states::bundle_state::BundleRetention;
+
+fn execute_block<DB>(cfg: CfgEnv, env: BlockEnv, txs: Vec<TxEnv>, db: DB)
+where
+    DB: DatabaseRef + Send + Sync + 'static,
+    DB::Error: Clone + Send + Sync + 'static,
+{
+    let db = Arc::new(db);
+    let txs = Arc::new(txs);
+
+    // with_bundle_update = true  -> track transitions so we can extract a BundleState afterwards
+    // update_db_metrics  = false -> set true to record the `levm.db_latency_us` metric
+    let state = ParallelState::new(db.clone(), true, false);
+
+    // Dependencies are discovered dynamically from speculative reads and writes. Passing an
+    // explicit runtime config keeps block execution independent of process environment variables.
+    let scheduler = Scheduler::new_with_runtime_config(
+        cfg,
+        env,
+        txs,
+        state,
+        None, // optional custom precompiles
+        LevmConfig::default(),
+    );
+
+    scheduler.execute().expect("block execution failed");
+
+    let (results, mut state) = scheduler.take_result_and_state();
+    let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+
+    // `results`: one outcome per transaction, in order. Transaction-validation errors are
+    // returned as `Skipped(InvalidTransaction)` and do not modify state or consume gas.
+    for outcome in &results {
+        match outcome {
+            TxExecutionOutcome::Executed(result) => {
+                let _gas_used = result.tx_gas_used();
+            }
+            TxExecutionOutcome::Skipped(reason) => {
+                eprintln!("transaction skipped: {reason:?}");
+            }
+        }
+    }
+    // `bundle`:  the `BundleState` to persist to your database.
+    let _ = (results, bundle);
+}
+```
+
+Key signatures:
+
+```rust
+use std::sync::Arc;
+
+use levm::{
+    DynParallelPrecompile, LevmConfig, LevmError, ParallelState, ParallelTakeBundle, Scheduler,
+    TxExecutionOutcome,
+};
+use revm::DatabaseRef;
+use revm_context::{BlockEnv, CfgEnv, TxEnv};
+use revm_database::{BundleState, states::bundle_state::BundleRetention};
+use revm_primitives::Address;
+
+impl<DB> Scheduler<DB>
+where
+    DB: DatabaseRef + Send + Sync,
+    DB::Error: Clone + Send + Sync + 'static,
+{
+    pub fn new(
+        cfg: CfgEnv,
+        env: BlockEnv,
+        txs: Arc<Vec<TxEnv>>,
+        state: ParallelState<DB>,
+        custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
+    ) -> Self;
+
+    pub fn new_with_runtime_config(
+        cfg: CfgEnv,
+        env: BlockEnv,
+        txs: Arc<Vec<TxEnv>>,
+        state: ParallelState<DB>,
+        custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
+        config: LevmConfig,
+    ) -> Self;
+
+    pub fn execute(&self) -> Result<(), LevmError<DB::Error>>;
+
+    pub fn take_result_and_state(self) -> (Vec<TxExecutionOutcome>, ParallelState<DB>);
+}
+
+impl<DB: DatabaseRef> ParallelState<DB> {
+    pub fn new(database: DB, with_bundle_update: bool, update_db_metrics: bool) -> Self;
+}
+
+impl<DB: DatabaseRef> ParallelTakeBundle for ParallelState<DB> {
+    fn parallel_take_bundle(&mut self, retention: BundleRetention) -> BundleState;
+}
+```
+
+Public items re-exported from the crate root include `Scheduler`, `LevmConfig`,
+`DelegatedSafetyConfig`, `ParallelState`, `ParallelCacheState`, `TxExecutionOutcome`,
+`InvalidTransaction`, `LevmError`, `ParallelPrecompile`, `DynParallelPrecompile`,
+`ParallelPrecompileInput`, `ParallelPrecompileState`, `ParallelPrecompileResult`, and
+`ParallelPrecompileError`.
+`ParallelBundleState` is the lower-level extension for applying transitions directly to revm's
+`BundleState`; `ParallelTakeBundle` finalizes and extracts a block bundle.
+
+The canonical `new_with_runtime_config` path uses only the supplied `LevmConfig`.
+`Scheduler::new` and explicit `LevmConfig::from_env()` opt into environment variables
+(`LEVM_MIN_PARALLEL_TXS`, `LEVM_FALLBACK_SEQUENTIAL`, `LEVM_CONCURRENT_LEVEL`). See
+[Testing & Benchmarking](testing.md#environment-variable-knobs) for the full list and a working
+end-to-end harness (`src/test_utils/common/execute.rs`).
+
+## Optional delegated-account policy
+
+`DelegatedSafetyConfig` contains two Levm/Liquent-specific, opt-in EIP-7702 policies. Both are
+disabled by default to preserve stock revm/Ethereum execution semantics. They are automatically
+inactive before Prague, so one block-scoped policy configuration can safely be reused while
+replaying historical blocks:
+
+- `forbid_delegated_create` makes `CREATE` and `CREATE2` halt as not activated while executing in a
+  delegated account's context.
+- `reserve_delegated_balance` rolls back transaction execution state when a surviving delegated
+  debit would consume funds conservatively reserved for later block transactions. It returns a
+  charged top-level revert while retaining the transaction nonce, EIP-7702 authorization effects,
+  and authorization refund.
+
+Enable either policy explicitly in the block-scoped runtime configuration:
+
+```rust
+use levm::{DelegatedSafetyConfig, LevmConfig};
+
+let config =
+    LevmConfig::default().with_delegated_safety(DelegatedSafetyConfig::enabled());
+```
+
+## Integration with reth
+
+Levm is integrated into Liquent's reth fork,
+[liquent-reth](https://github.com/liquentlabs/liquent-reth). The
+`reth_evm::parallel_execute::ParallelExecutor` trait defines the integration boundary;
+`reth_evm_ethereum::parallel_execute::LevmExecutor` drives block execution through this crate's
+`Scheduler`, and `reth-pipe-exec-layer-ext-v2` consumes that interface. Refer to liquent-reth for
+the full node wiring; this crate provides the parallel execution engine itself.
+
+## Metrics
+
+Levm reports execution metrics via the [`metrics`](https://crates.io/crates/metrics) crate (scope
+`levm`). Integrate the [Prometheus exporter](https://crates.io/crates/metrics-exporter-prometheus)
+to scrape them. Scheduler metrics below are histograms with one sample per accepted execution
+attempt, including attempts that return an execution error. Count fields describe that attempt,
+not process-lifetime totals; `execution_time` is omitted on purely sequential paths.
+
+| Metric | Description |
+| --- | --- |
+| `levm.total_tx_cnt` | Total number of transactions. |
+| `levm.execution_cnt` | Number of execution incarnations. |
+| `levm.validation_cnt` | Number of validation incarnations. |
+| `levm.conflict_cnt` | Number of conflict incarnations. |
+| `levm.reset_validation_idx_cnt` | Number of validation resets. |
+| `levm.useless_dependent_update` | Number of useless dependency updates. |
+| `levm.conflict_by_miner` | Beneficiary-history reads blocked by an unresolved predecessor (name retained for compatibility). |
+| `levm.conflict_by_error` | Conflicts caused by an EVM error. |
+| `levm.conflict_by_estimate` | Conflicts caused by an estimate (speculative read). |
+| `levm.conflict_by_version` | Conflicts caused by a version mismatch. |
+| `levm.no_dependency_txs` | Transactions executed with no dependency. |
+| `levm.one_attempt_with_dependency` | Dependent transactions finalized on the first incarnation. |
+| `levm.more_attempts_with_dependency` | Dependent transactions needing more than two incarnations. |
+| `levm.conflict_txs` | Number of conflicting transactions. |
+| `levm.execution_time` | Parallel finality-loop duration from block start (nanoseconds; omitted on the sequential path). |
+| `levm.commit_time` | Cumulative ordered-commit attempt time for the block (nanoseconds). |
+| `levm.total_time` | End-to-end scheduler duration, including recovery replay (nanoseconds). |
+
+The following metrics are recorded per event rather than once per block:
+
+| Metric | Kind | Description |
+| --- | --- | --- |
+| `levm.dependency_distance` | histogram | Distance from a successfully validated transaction to its latest recorded preceding writer. |
+| `levm.db_latency_us` | histogram | Backing `DatabaseRef` call latency on cache misses, in microseconds; enabled by `ParallelState::new(..., update_db_metrics = true)`. |
+| `levm.reserve_query_count` | counter | Delegated-balance reserve queries. |
+| `levm.reserve_schedule_build_count` | counter | Per-account reserve schedules built lazily. |
+| `levm.reserve_index_build_count` | counter | Lazy sender indexes built. |
+| `levm.reserve_debit_candidates` | counter | Journal debit candidates inspected by reserve protection. |
+| `levm.reserve_schedule_build_time` | histogram | Per-account reserve-schedule build time in nanoseconds. |
+| `levm.reserve_index_build_time` | histogram | Sender-index build time in nanoseconds. |
